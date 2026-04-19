@@ -1,4 +1,4 @@
 #!/bin/zsh
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-exec "$SCRIPT_DIR/run-codex-rate-limits-window.sh"
+source "$HOME/.zprofile" >/dev/null 2>&1 || true
+exec "$HOME/bin/codex-rate-limits.command"
