@@ -25,6 +25,7 @@ WIDGET_STATE_PATH = (
 )
 SCAN_FILE_COUNT = 24
 STALE_AFTER_SECONDS = 15 * 60
+STRICT_SWITCH_GRACE_SECONDS = 5 * 60
 BAR_WIDTH = 24
 SESSION_FILENAME_RE = re.compile(r"rollout-(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2})")
 
@@ -161,14 +162,17 @@ def extract_latest_snapshot(path: Path) -> Optional[dict]:
     return None
 
 
-def find_latest_snapshot(min_timestamp: Optional[datetime] = None) -> Optional[dict]:
+def find_latest_snapshot(
+    min_timestamp: Optional[datetime] = None,
+    require_new_session: bool = False,
+) -> Optional[dict]:
     candidates = []
     for path in iter_recent_session_files(SESSIONS_ROOT, SCAN_FILE_COUNT):
         snapshot = extract_latest_snapshot(path)
         if snapshot is not None:
             if min_timestamp is not None and snapshot["timestamp"] < min_timestamp:
                 continue
-            if min_timestamp is not None:
+            if min_timestamp is not None and require_new_session:
                 started_at = snapshot.get("session_started_at")
                 if started_at is None or started_at < min_timestamp:
                     continue
@@ -305,7 +309,18 @@ def current_boundary(widget_state: dict) -> Optional[datetime]:
 def snapshot_context() -> dict:
     auth_state, widget_state = sync_widget_state()
     boundary = current_boundary(widget_state)
-    snapshot = find_latest_snapshot(min_timestamp=boundary)
+    strict_snapshot = find_latest_snapshot(min_timestamp=boundary, require_new_session=True)
+    relaxed_snapshot = find_latest_snapshot(min_timestamp=boundary, require_new_session=False)
+    snapshot = strict_snapshot
+    if boundary is None:
+        snapshot = relaxed_snapshot
+    else:
+        boundary_age = max(0.0, (datetime.now(timezone.utc) - boundary).total_seconds())
+        if snapshot is None:
+            snapshot = relaxed_snapshot
+        elif relaxed_snapshot is not None and boundary_age >= STRICT_SWITCH_GRACE_SECONDS:
+            if relaxed_snapshot["timestamp"] > snapshot["timestamp"]:
+                snapshot = relaxed_snapshot
     return {
         "snapshot": snapshot,
         "auth_state": auth_state,
