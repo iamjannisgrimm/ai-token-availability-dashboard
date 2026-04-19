@@ -1,21 +1,32 @@
 #!/usr/bin/env python3
 
 import argparse
+import base64
 import heapq
 import json
 import os
+import re
+import select
 import shutil
+import subprocess
 import sys
+import termios
 import time
+import tty
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator, Optional
 
 
 SESSIONS_ROOT = Path.home() / ".codex" / "sessions"
+AUTH_PATH = Path.home() / ".codex" / "auth.json"
+WIDGET_STATE_PATH = (
+    Path.home() / "Library" / "Application Support" / "Codex Rate Limits Widget" / "state.json"
+)
 SCAN_FILE_COUNT = 24
 STALE_AFTER_SECONDS = 15 * 60
 BAR_WIDTH = 24
+SESSION_FILENAME_RE = re.compile(r"rollout-(\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2})")
 
 
 RESET = "\033[0m"
@@ -142,6 +153,7 @@ def extract_latest_snapshot(path: Path) -> Optional[dict]:
         return {
             "timestamp": timestamp,
             "session_path": str(path),
+            "session_started_at": session_started_at(path),
             "rate_limits": rate_limits,
             "info": payload.get("info"),
         }
@@ -149,17 +161,157 @@ def extract_latest_snapshot(path: Path) -> Optional[dict]:
     return None
 
 
-def find_latest_snapshot() -> Optional[dict]:
+def find_latest_snapshot(min_timestamp: Optional[datetime] = None) -> Optional[dict]:
     candidates = []
     for path in iter_recent_session_files(SESSIONS_ROOT, SCAN_FILE_COUNT):
         snapshot = extract_latest_snapshot(path)
         if snapshot is not None:
+            if min_timestamp is not None and snapshot["timestamp"] < min_timestamp:
+                continue
+            if min_timestamp is not None:
+                started_at = snapshot.get("session_started_at")
+                if started_at is None or started_at < min_timestamp:
+                    continue
             candidates.append(snapshot)
 
     if not candidates:
         return None
 
     return max(candidates, key=lambda item: item["timestamp"])
+
+
+def decode_jwt_payload(token: Optional[str]) -> dict:
+    if not token or token.count(".") < 2:
+        return {}
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        decoded = base64.urlsafe_b64decode(payload.encode("ascii"))
+        data = json.loads(decoded.decode("utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def load_auth_state() -> dict:
+    if not AUTH_PATH.exists():
+        return {
+            "account_id": None,
+            "email": None,
+            "plan_type": None,
+            "auth_mtime": None,
+        }
+
+    try:
+        raw = json.loads(AUTH_PATH.read_text())
+    except Exception:
+        return {
+            "account_id": None,
+            "email": None,
+            "plan_type": None,
+            "auth_mtime": datetime.fromtimestamp(AUTH_PATH.stat().st_mtime, tz=timezone.utc),
+        }
+
+    tokens = raw.get("tokens") if isinstance(raw, dict) else {}
+    if not isinstance(tokens, dict):
+        tokens = {}
+
+    id_payload = decode_jwt_payload(tokens.get("id_token"))
+    access_payload = decode_jwt_payload(tokens.get("access_token"))
+    profile = access_payload.get("https://api.openai.com/profile")
+    auth_info = id_payload.get("https://api.openai.com/auth")
+    if not isinstance(profile, dict):
+        profile = {}
+    if not isinstance(auth_info, dict):
+        auth_info = {}
+
+    email = id_payload.get("email") or profile.get("email")
+    plan_type = auth_info.get("chatgpt_plan_type") or access_payload.get("https://api.openai.com/auth", {}).get("chatgpt_plan_type")
+
+    return {
+        "account_id": tokens.get("account_id"),
+        "email": email,
+        "plan_type": plan_type,
+        "auth_mtime": datetime.fromtimestamp(AUTH_PATH.stat().st_mtime, tz=timezone.utc),
+    }
+
+
+def load_widget_state() -> dict:
+    if not WIDGET_STATE_PATH.exists():
+        return {}
+    try:
+        data = json.loads(WIDGET_STATE_PATH.read_text())
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_widget_state(state: dict) -> None:
+    WIDGET_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    WIDGET_STATE_PATH.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
+
+
+def parse_epoch_timestamp(value: object) -> Optional[datetime]:
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(float(value), tz=timezone.utc)
+    if isinstance(value, str):
+        return parse_timestamp(value)
+    return None
+
+
+def session_started_at(path: Path) -> Optional[datetime]:
+    match = SESSION_FILENAME_RE.search(path.name)
+    if match:
+        try:
+            local_tz = datetime.now().astimezone().tzinfo or timezone.utc
+            return (
+                datetime.strptime(match.group(1), "%Y-%m-%dT%H-%M-%S")
+                .replace(tzinfo=local_tz)
+                .astimezone(timezone.utc)
+            )
+        except ValueError:
+            pass
+    try:
+        return datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+    except OSError:
+        return None
+
+
+def sync_widget_state(force_boundary: bool = False) -> tuple[dict, dict]:
+    auth_state = load_auth_state()
+    widget_state = load_widget_state()
+    current_account_id = auth_state.get("account_id")
+    stored_account_id = widget_state.get("account_id")
+    auth_mtime = auth_state.get("auth_mtime")
+
+    if force_boundary and auth_mtime is not None:
+        widget_state["account_switch_boundary"] = auth_mtime.isoformat()
+
+    if stored_account_id != current_account_id:
+        widget_state["account_id"] = current_account_id
+        if auth_mtime is not None:
+            widget_state["account_switch_boundary"] = auth_mtime.isoformat()
+
+    if widget_state:
+        save_widget_state(widget_state)
+
+    return auth_state, widget_state
+
+
+def current_boundary(widget_state: dict) -> Optional[datetime]:
+    return parse_epoch_timestamp(widget_state.get("account_switch_boundary"))
+
+
+def snapshot_context() -> dict:
+    auth_state, widget_state = sync_widget_state()
+    boundary = current_boundary(widget_state)
+    snapshot = find_latest_snapshot(min_timestamp=boundary)
+    return {
+        "snapshot": snapshot,
+        "auth_state": auth_state,
+        "widget_state": widget_state,
+        "boundary": boundary,
+    }
 
 
 def percent_remaining(used_percent: Optional[float]) -> Optional[float]:
@@ -236,6 +388,14 @@ def box(lines: list[str], width: int) -> str:
     return "\n".join([top, *body, bottom])
 
 
+def subtle_controls(width: int) -> str:
+    lines = [
+        f"{DIM}{BOLD}s{RESET}{DIM} switch account >{RESET}",
+        f"{DIM}{BOLD}q{RESET}{DIM} quit >{RESET}",
+    ]
+    return "\n".join(pad_line(line, width) for line in lines)
+
+
 def progress_bar(used_percent: Optional[float], width: int = BAR_WIDTH) -> str:
     if used_percent is None:
         return f"{MUTED}{'·' * width}{RESET}"
@@ -287,13 +447,16 @@ def build_window_lines(label: str, data: Optional[dict], now: datetime) -> list[
     ]
 
 
-def render_dashboard(snapshot: dict, interval: float, now: datetime) -> str:
+def render_dashboard(snapshot: dict, interval: float, now: datetime, auth_state: Optional[dict] = None) -> str:
     width = min(76, terminal_width() - 2)
     rate_limits = snapshot["rate_limits"]
     snapshot_time = snapshot["timestamp"].astimezone()
     age_seconds = max(0.0, (now - snapshot["timestamp"]).total_seconds())
     primary = rate_limits.get("primary")
     secondary = rate_limits.get("secondary")
+    account_text = "unknown"
+    if isinstance(auth_state, dict):
+        account_text = auth_state.get("email") or auth_state.get("account_id") or "unknown"
 
     title = f"{BOLD}{CYAN}Codex Rate Limits{RESET}"
     subtitle = f"{DIM}subscription telemetry from ~/.codex/sessions{RESET}"
@@ -303,6 +466,7 @@ def render_dashboard(snapshot: dict, interval: float, now: datetime) -> str:
         f"{MUTED}Plan{RESET} {BOLD}{(rate_limits.get('plan_type') or 'unknown').upper()}{RESET}   "
         f"{MUTED}Limit{RESET} {rate_limits.get('limit_id') or 'unknown'}   "
         f"{MUTED}Status{RESET} {style_status(age_seconds)}",
+        f"{MUTED}Account{RESET} {account_text}",
         f"{MUTED}Updated{RESET} {snapshot_time.strftime('%Y-%m-%d %H:%M:%S %Z')}   "
         f"{MUTED}Age{RESET} {format_duration(age_seconds)}",
         f"{MUTED}Now{RESET} {now.astimezone().strftime('%Y-%m-%d %H:%M:%S %Z')}   "
@@ -314,7 +478,7 @@ def render_dashboard(snapshot: dict, interval: float, now: datetime) -> str:
         *build_window_lines("Weekly limit", secondary, now),
     ]
 
-    return "\n".join([box(summary_lines, width), box(limit_lines, width)])
+    return "\n".join([box(summary_lines, width), box(limit_lines, width), subtle_controls(width)])
 
 
 def snapshot_to_json(snapshot: dict) -> str:
@@ -339,28 +503,130 @@ def snapshot_to_json(snapshot: dict) -> str:
     return json.dumps(result, indent=2, sort_keys=True)
 
 
-def render_snapshot(snapshot: Optional[dict], interval: float, clear: bool) -> None:
+def render_snapshot(context: dict, interval: float, clear: bool) -> None:
     if clear:
         screen_clear()
 
     now = datetime.now(timezone.utc)
     width = min(76, terminal_width() - 2)
+    snapshot = context.get("snapshot")
+    auth_state = context.get("auth_state") or {}
+    boundary = context.get("boundary")
 
     if snapshot is None:
-        print(
-            box(
+        lines = [
+            f"{BOLD}{CYAN}Codex Rate Limits{RESET}",
+            "",
+        ]
+        if boundary is not None:
+            account_text = auth_state.get("email") or auth_state.get("account_id") or "current account"
+            lines.extend(
                 [
-                    f"{BOLD}{CYAN}Codex Rate Limits{RESET}",
-                    "",
-                    "No recent rate-limit telemetry found in ~/.codex/sessions.",
-                    f"{MUTED}Refresh{RESET} every {interval:g}s",
-                ],
-                width,
+                    f"No rate-limit telemetry yet for {account_text}.",
+                    f"{MUTED}Signed-in boundary{RESET} {boundary.astimezone().strftime('%Y-%m-%d %H:%M:%S %Z')}",
+                    "Start a new Codex conversation under the new account to populate telemetry.",
+                ]
             )
+        else:
+            lines.append("No recent rate-limit telemetry found in ~/.codex/sessions.")
+        lines.extend(
+            [
+                f"{MUTED}Refresh{RESET} every {interval:g}s",
+            ]
         )
+        print("\n".join([box(lines, width), subtle_controls(width)]))
         return
 
-    print(render_dashboard(snapshot, interval, now))
+    print(render_dashboard(snapshot, interval, now, auth_state=auth_state))
+
+
+class TerminalMode:
+    def __init__(self) -> None:
+        self.enabled = False
+        self.fd: Optional[int] = None
+        self.original_attrs = None
+
+    def __enter__(self) -> "TerminalMode":
+        if sys.stdin.isatty():
+            self.fd = sys.stdin.fileno()
+            self.original_attrs = termios.tcgetattr(self.fd)
+            tty.setcbreak(self.fd)
+            self.enabled = True
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.restore()
+
+    def restore(self) -> None:
+        if self.enabled and self.fd is not None and self.original_attrs is not None:
+            termios.tcsetattr(self.fd, termios.TCSADRAIN, self.original_attrs)
+            self.enabled = False
+
+    def enable(self) -> None:
+        if self.fd is not None and self.original_attrs is not None and not self.enabled:
+            tty.setcbreak(self.fd)
+            self.enabled = True
+
+
+def read_key(timeout: float) -> Optional[str]:
+    if not sys.stdin.isatty():
+        time.sleep(timeout)
+        return None
+
+    ready, _, _ = select.select([sys.stdin], [], [], timeout)
+    if not ready:
+        return None
+
+    try:
+        return os.read(sys.stdin.fileno(), 1).decode("utf-8", errors="ignore")
+    except OSError:
+        return None
+
+
+def run_account_switch(term: TerminalMode) -> None:
+    previous_auth_state = load_auth_state()
+    term.restore()
+    screen_clear()
+    print(f"{CYAN}Switching Codex account...{RESET}")
+    print(f"{MUTED}Signing out current Codex account...{RESET}")
+    subprocess.run(["codex", "logout"], check=False)
+    print()
+    print(f"{MUTED}Starting Codex login. Complete the flow, then return to this window.{RESET}")
+    print()
+    subprocess.run(["codex", "login"], check=False)
+    auth_state, _ = sync_widget_state(force_boundary=True)
+    current_account = auth_state.get("email") or auth_state.get("account_id") or "unknown"
+    previous_account = previous_auth_state.get("email") or previous_auth_state.get("account_id") or "unknown"
+    if current_account != previous_account:
+        print()
+        print(f"{MUTED}Restarting Codex app so fresh sessions pick up the new login...{RESET}")
+        subprocess.run(
+            ["osascript", "-e", 'tell application "Codex" to quit'],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        time.sleep(0.7)
+        subprocess.run(["open", "-a", "Codex"], check=False)
+        print(f"{MUTED}Initializing fresh telemetry quietly in the background...{RESET}")
+        subprocess.Popen(
+            [
+                "codex",
+                "exec",
+                "--skip-git-repo-check",
+                "-C",
+                str(Path.home()),
+                "Reply with exactly: ok",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+        )
+    print()
+    print(f"{GREEN}Account switch flow finished for {current_account}.{RESET}")
+    print(f"{YELLOW}Older conversations keep their previous session context. Use a new conversation for the new account.{RESET}")
+    time.sleep(1.2)
+    term.enable()
 
 
 def main() -> int:
@@ -370,7 +636,7 @@ def main() -> int:
         return 2
 
     if args.json:
-        snapshot = find_latest_snapshot()
+        snapshot = snapshot_context()["snapshot"]
         if snapshot is None:
             print(json.dumps({"error": "no recent rate-limit telemetry found"}, indent=2))
             return 1
@@ -378,13 +644,20 @@ def main() -> int:
         return 0
 
     if args.once:
-        render_snapshot(find_latest_snapshot(), args.interval, clear=False)
+        render_snapshot(snapshot_context(), args.interval, clear=False)
         return 0
 
     try:
-        while True:
-            render_snapshot(find_latest_snapshot(), args.interval, clear=not args.no_clear)
-            time.sleep(args.interval)
+        with TerminalMode() as term:
+            while True:
+                render_snapshot(snapshot_context(), args.interval, clear=not args.no_clear)
+                key = read_key(args.interval)
+                if key is None:
+                    continue
+                if key.lower() == "q":
+                    return 0
+                if key.lower() == "s":
+                    run_account_switch(term)
     except KeyboardInterrupt:
         return 0
 
