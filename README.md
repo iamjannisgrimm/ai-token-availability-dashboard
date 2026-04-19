@@ -2,6 +2,8 @@
 
 Small macOS terminal widget for showing the current Codex subscription rate-limit usage from local Codex session telemetry.
 
+<img width="641" height="284" alt="Screenshot 2026-04-19 at 12 50 02 PM" src="https://github.com/user-attachments/assets/4fc7669e-4fd3-40d7-be9f-d6140f64e996" />
+
 It reads `~/.codex/sessions/**/*.jsonl` and displays the latest `rate_limits` snapshot in a compact terminal dashboard.
 
 ## Important behavior
