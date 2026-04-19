@@ -1,0 +1,374 @@
+#!/usr/bin/env python3
+
+import argparse
+import heapq
+import json
+import os
+import shutil
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Iterator, Optional
+
+
+SESSIONS_ROOT = Path.home() / ".codex" / "sessions"
+SCAN_FILE_COUNT = 24
+STALE_AFTER_SECONDS = 15 * 60
+BAR_WIDTH = 24
+
+
+RESET = "\033[0m"
+BOLD = "\033[1m"
+DIM = "\033[2m"
+CYAN = "\033[38;5;45m"
+GREEN = "\033[38;5;78m"
+YELLOW = "\033[38;5;221m"
+RED = "\033[38;5;203m"
+MUTED = "\033[38;5;245m"
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Show current Codex subscription rate-limit usage by reading recent "
+            "~/.codex/session telemetry."
+        )
+    )
+    parser.add_argument(
+        "-i",
+        "--interval",
+        type=float,
+        default=3.0,
+        help="Refresh interval in seconds for watch mode. Default: 3",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print the latest snapshot as JSON and exit.",
+    )
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="Print one human-readable snapshot and exit.",
+    )
+    parser.add_argument(
+        "--no-clear",
+        action="store_true",
+        help="Do not clear the screen between refreshes in watch mode.",
+    )
+    return parser.parse_args()
+
+
+def iter_recent_session_files(root: Path, limit: int) -> list[Path]:
+    if not root.exists():
+        return []
+    return heapq.nlargest(
+        limit,
+        (path for path in root.rglob("*.jsonl") if path.is_file()),
+        key=lambda path: path.stat().st_mtime,
+    )
+
+
+def iter_lines_reverse(path: Path, chunk_size: int = 8192) -> Iterator[str]:
+    with path.open("rb") as handle:
+        handle.seek(0, os.SEEK_END)
+        position = handle.tell()
+        remainder = b""
+
+        while position > 0:
+            read_size = min(chunk_size, position)
+            position -= read_size
+            handle.seek(position)
+            chunk = handle.read(read_size)
+            parts = (chunk + remainder).split(b"\n")
+            remainder = parts[0]
+
+            for part in reversed(parts[1:]):
+                if part:
+                    yield part.decode("utf-8", errors="replace")
+
+        if remainder:
+            yield remainder.decode("utf-8", errors="replace")
+
+
+def parse_timestamp(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def extract_latest_snapshot(path: Path) -> Optional[dict]:
+    for line in iter_lines_reverse(path):
+        if '"rate_limits"' not in line:
+            continue
+
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
+        payload = record.get("payload") or {}
+        rate_limits = payload.get("rate_limits")
+        if not isinstance(rate_limits, dict):
+            continue
+
+        timestamp = parse_timestamp(record.get("timestamp"))
+        if timestamp is None:
+            continue
+
+        return {
+            "timestamp": timestamp,
+            "session_path": str(path),
+            "rate_limits": rate_limits,
+            "info": payload.get("info"),
+        }
+
+    return None
+
+
+def find_latest_snapshot() -> Optional[dict]:
+    candidates = []
+    for path in iter_recent_session_files(SESSIONS_ROOT, SCAN_FILE_COUNT):
+        snapshot = extract_latest_snapshot(path)
+        if snapshot is not None:
+            candidates.append(snapshot)
+
+    if not candidates:
+        return None
+
+    return max(candidates, key=lambda item: item["timestamp"])
+
+
+def percent_remaining(used_percent: Optional[float]) -> Optional[float]:
+    if used_percent is None:
+        return None
+    return max(0.0, 100.0 - float(used_percent))
+
+
+def format_duration(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    days, seconds = divmod(seconds, 86400)
+    hours, seconds = divmod(seconds, 3600)
+    minutes, seconds = divmod(seconds, 60)
+
+    parts = []
+    if days:
+        parts.append(f"{days}d")
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes:
+        parts.append(f"{minutes}m")
+    if seconds or not parts:
+        parts.append(f"{seconds}s")
+    return " ".join(parts)
+
+
+def screen_clear() -> None:
+    sys.stdout.write("\033[2J\033[H")
+    sys.stdout.flush()
+
+
+def color_for_used(used_percent: Optional[float]) -> str:
+    if used_percent is None:
+        return MUTED
+    if used_percent >= 85:
+        return RED
+    if used_percent >= 60:
+        return YELLOW
+    return GREEN
+
+
+def terminal_width() -> int:
+    return max(60, shutil.get_terminal_size(fallback=(78, 30)).columns)
+
+
+def pad_line(text: str, width: int) -> str:
+    visible = len(strip_ansi(text))
+    if visible >= width:
+        return text
+    return text + (" " * (width - visible))
+
+
+def strip_ansi(value: str) -> str:
+    out = []
+    i = 0
+    while i < len(value):
+        if value[i] == "\033":
+            i += 1
+            if i < len(value) and value[i] == "[":
+                i += 1
+                while i < len(value) and value[i] not in "ABCDEFGHJKSTfmnsu":
+                    i += 1
+        else:
+            out.append(value[i])
+        i += 1
+    return "".join(out)
+
+
+def box(lines: list[str], width: int) -> str:
+    inner = max(10, width - 4)
+    top = f"{MUTED}┌{'─' * (inner + 2)}┐{RESET}"
+    bottom = f"{MUTED}└{'─' * (inner + 2)}┘{RESET}"
+    body = [f"{MUTED}│{RESET} {pad_line(line, inner)} {MUTED}│{RESET}" for line in lines]
+    return "\n".join([top, *body, bottom])
+
+
+def progress_bar(used_percent: Optional[float], width: int = BAR_WIDTH) -> str:
+    if used_percent is None:
+        return f"{MUTED}{'·' * width}{RESET}"
+    filled = round((max(0.0, min(100.0, used_percent)) / 100.0) * width)
+    empty = width - filled
+    color = color_for_used(used_percent)
+    return f"{color}{'█' * filled}{MUTED}{'░' * empty}{RESET}"
+
+
+def pie_gauge(used_percent: Optional[float]) -> str:
+    if used_percent is None:
+        return f"{MUTED}○{RESET}"
+    glyphs = ["○", "◔", "◑", "◕", "●"]
+    index = min(len(glyphs) - 1, max(0, round((used_percent / 100.0) * (len(glyphs) - 1))))
+    return f"{color_for_used(used_percent)}{glyphs[index]}{RESET}"
+
+
+def style_status(age_seconds: float) -> str:
+    if age_seconds > STALE_AFTER_SECONDS:
+        return f"{YELLOW}stale{RESET}"
+    return f"{GREEN}live{RESET}"
+
+
+def build_window_lines(label: str, data: Optional[dict], now: datetime) -> list[str]:
+    if not isinstance(data, dict):
+        return [f"{BOLD}{label}{RESET}", f"{MUTED}No telemetry available.{RESET}"]
+
+    used = data.get("used_percent")
+    remaining = percent_remaining(used)
+    window_minutes = data.get("window_minutes")
+    reset_epoch = data.get("resets_at")
+    reset_at = (
+        datetime.fromtimestamp(reset_epoch, tz=timezone.utc)
+        if isinstance(reset_epoch, (int, float))
+        else None
+    )
+    reset_local = reset_at.astimezone() if reset_at else None
+    until_reset = format_duration((reset_at - now).total_seconds()) if reset_at else "unknown"
+    window_label = f"{window_minutes}m" if window_minutes else "unknown"
+    reset_text = reset_local.strftime("%Y-%m-%d %H:%M:%S %Z") if reset_local else "unknown"
+    used_text = f"{float(used):.1f}%" if used is not None else "n/a"
+    remaining_text = f"{remaining:.1f}%" if remaining is not None else "n/a"
+    color = color_for_used(used)
+
+    return [
+        f"{BOLD}{label}{RESET}  {pie_gauge(used)}  {color}{used_text} used{RESET}  {CYAN}{remaining_text} left{RESET}",
+        f"{progress_bar(used)}",
+        f"{MUTED}Window{RESET} {window_label}   {MUTED}Reset in{RESET} {until_reset}   {MUTED}At{RESET} {reset_text}",
+    ]
+
+
+def render_dashboard(snapshot: dict, interval: float, now: datetime) -> str:
+    width = min(76, terminal_width() - 2)
+    rate_limits = snapshot["rate_limits"]
+    snapshot_time = snapshot["timestamp"].astimezone()
+    age_seconds = max(0.0, (now - snapshot["timestamp"]).total_seconds())
+    primary = rate_limits.get("primary")
+    secondary = rate_limits.get("secondary")
+
+    title = f"{BOLD}{CYAN}Codex Rate Limits{RESET}"
+    subtitle = f"{DIM}subscription telemetry from ~/.codex/sessions{RESET}"
+    summary_lines = [
+        title,
+        subtitle,
+        f"{MUTED}Plan{RESET} {BOLD}{(rate_limits.get('plan_type') or 'unknown').upper()}{RESET}   "
+        f"{MUTED}Limit{RESET} {rate_limits.get('limit_id') or 'unknown'}   "
+        f"{MUTED}Status{RESET} {style_status(age_seconds)}",
+        f"{MUTED}Updated{RESET} {snapshot_time.strftime('%Y-%m-%d %H:%M:%S %Z')}   "
+        f"{MUTED}Age{RESET} {format_duration(age_seconds)}",
+        f"{MUTED}Now{RESET} {now.astimezone().strftime('%Y-%m-%d %H:%M:%S %Z')}   "
+        f"{MUTED}Refresh{RESET} every {interval:g}s",
+    ]
+
+    limit_lines = [
+        *build_window_lines("5h limit", primary, now),
+        *build_window_lines("Weekly limit", secondary, now),
+    ]
+
+    return "\n".join([box(summary_lines, width), box(limit_lines, width)])
+
+
+def snapshot_to_json(snapshot: dict) -> str:
+    timestamp = snapshot["timestamp"].astimezone().isoformat()
+    rate_limits = snapshot["rate_limits"]
+    primary = rate_limits.get("primary") or {}
+    secondary = rate_limits.get("secondary") or {}
+    result = {
+        "timestamp": timestamp,
+        "session_path": snapshot["session_path"],
+        "plan_type": rate_limits.get("plan_type"),
+        "limit_id": rate_limits.get("limit_id"),
+        "primary": {
+            **primary,
+            "remaining_percent": percent_remaining(primary.get("used_percent")),
+        },
+        "secondary": {
+            **secondary,
+            "remaining_percent": percent_remaining(secondary.get("used_percent")),
+        },
+    }
+    return json.dumps(result, indent=2, sort_keys=True)
+
+
+def render_snapshot(snapshot: Optional[dict], interval: float, clear: bool) -> None:
+    if clear:
+        screen_clear()
+
+    now = datetime.now(timezone.utc)
+    width = min(76, terminal_width() - 2)
+
+    if snapshot is None:
+        print(
+            box(
+                [
+                    f"{BOLD}{CYAN}Codex Rate Limits{RESET}",
+                    "",
+                    "No recent rate-limit telemetry found in ~/.codex/sessions.",
+                    f"{MUTED}Refresh{RESET} every {interval:g}s",
+                ],
+                width,
+            )
+        )
+        return
+
+    print(render_dashboard(snapshot, interval, now))
+
+
+def main() -> int:
+    args = parse_args()
+    if args.interval <= 0:
+        print("--interval must be greater than 0", file=sys.stderr)
+        return 2
+
+    if args.json:
+        snapshot = find_latest_snapshot()
+        if snapshot is None:
+            print(json.dumps({"error": "no recent rate-limit telemetry found"}, indent=2))
+            return 1
+        print(snapshot_to_json(snapshot))
+        return 0
+
+    if args.once:
+        render_snapshot(find_latest_snapshot(), args.interval, clear=False)
+        return 0
+
+    try:
+        while True:
+            render_snapshot(find_latest_snapshot(), args.interval, clear=not args.no_clear)
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
