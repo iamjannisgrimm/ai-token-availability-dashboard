@@ -101,6 +101,25 @@ def parse_timestamp(value: Optional[str]) -> Optional[datetime]:
         return None
 
 
+def extract_rate_limits(record: dict) -> Optional[dict]:
+    payload = record.get("payload")
+    candidates = [
+        record.get("rate_limits"),
+        payload.get("rate_limits") if isinstance(payload, dict) else None,
+    ]
+
+    if isinstance(payload, dict):
+        info = payload.get("info")
+        if isinstance(info, dict):
+            candidates.append(info.get("rate_limits"))
+
+    for candidate in candidates:
+        if isinstance(candidate, dict):
+            return candidate
+
+    return None
+
+
 def extract_latest_snapshot(path: Path) -> Optional[dict]:
     for line in iter_lines_reverse(path):
         if '"rate_limits"' not in line:
@@ -112,7 +131,7 @@ def extract_latest_snapshot(path: Path) -> Optional[dict]:
             continue
 
         payload = record.get("payload") or {}
-        rate_limits = payload.get("rate_limits")
+        rate_limits = extract_rate_limits(record)
         if not isinstance(rate_limits, dict):
             continue
 

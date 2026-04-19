@@ -8,7 +8,7 @@ DOCS_LAUNCHER="$HOME/Documents/Open Codex Rate Limits.command"
 LAUNCH_AGENT_DIR="$HOME/Library/LaunchAgents"
 LAUNCH_AGENT_PATH="$LAUNCH_AGENT_DIR/com.jannis.codex-rate-limits.plist"
 
-mkdir -p "$BIN_DIR" "$LAUNCH_AGENT_DIR"
+mkdir -p "$BIN_DIR" "$HOME/Documents" "$LAUNCH_AGENT_DIR"
 
 cp "$SCRIPT_DIR/codex-rate-limits" "$BIN_DIR/codex-rate-limits"
 cp "$SCRIPT_DIR/codex-rate-limits.command" "$BIN_DIR/codex-rate-limits.command"
@@ -44,7 +44,9 @@ cat > "$LAUNCH_AGENT_PATH" <<PLIST
 PLIST
 
 launchctl bootout "gui/$(id -u)" "$LAUNCH_AGENT_PATH" >/dev/null 2>&1 || true
-launchctl bootstrap "gui/$(id -u)" "$LAUNCH_AGENT_PATH"
+launchctl bootstrap "gui/$(id -u)" "$LAUNCH_AGENT_PATH" >/dev/null 2>&1 || true
+launchctl enable "gui/$(id -u)/com.jannis.codex-rate-limits" >/dev/null 2>&1 || true
+launchctl kickstart -k "gui/$(id -u)/com.jannis.codex-rate-limits" >/dev/null 2>&1 || true
 
 echo "Installed."
 echo "Documents launcher: $DOCS_LAUNCHER"
